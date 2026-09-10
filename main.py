@@ -42,3 +42,4 @@ def check_inside_bar():
 while True:
     check_inside_bar()
     time.sleep(15)
+    
