@@ -4,7 +4,7 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
-TELEGRAM_TOKEN = "8163156265:AAGuUYBf6urAsJhkzScZDiJhzt1GysNXn58"
+TELEGRAM_TOKEN = "8163156265:AAHGfJHD9Qu0yxDQFfwqXKCHFNHTgAApH_4"
 CHAT_ID = "6422746952"
 API_KEY = "60badeda201b49d2a4cc00079279da49"
 
@@ -15,7 +15,7 @@ def send_alert(message):
     payload = {"chat_id": CHAT_ID, "text": message}
     try:
         r = requests.post(url, json=payload, timeout=10)
-        print("Telegram Response:", r.status_code, r.text, flush=True)
+        print("Telegram Status:", r.status_code, r.text, flush=True)
     except Exception as e:
         print("Telegram Send Error:", e, flush=True)
 
@@ -25,7 +25,7 @@ def check_inside_bar():
     try:
         res = requests.get(url, timeout=10).json()
         if "values" not in res:
-            print("API Message/Error:", res.get("message", res), flush=True)
+            print("API Warning:", res.get("message", res), flush=True)
             return
 
         candles = res["values"]
@@ -43,14 +43,14 @@ def check_inside_bar():
                 last_candle_time = c_time
                 msg = (
                     f"🔔 XAU/USD 15M: Inside Bar Formed!\n\n"
-                    f"⏰ Time: {c_time}\n"
+                    f"⏰ Candle Time: {c_time}\n"
                     f"📈 High: {c1_h}\n"
                     f"📉 Low: {c1_l}\n"
                     f"Status: Confirmed Closed"
                 )
                 send_alert(msg)
     except Exception as e:
-        print("TwelveData Error:", e, flush=True)
+        print("Data Error:", e, flush=True)
 
 def bot_loop():
     time.sleep(3)
@@ -73,13 +73,11 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        return  # Render console noise prevent karne ke liye
+        return
 
 def run_server():
     port = int(os.environ.get("PORT", 10000))
-    print(f"Starting server on port {port}...", flush=True)
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    # Server start hone ke baad background worker launch karein
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
     server.serve_forever()
