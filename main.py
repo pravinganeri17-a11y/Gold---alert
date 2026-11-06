@@ -46,44 +46,104 @@ def get_candles(interval, count):
         print(f"Fetch error for {interval}:", e, flush=True)
     return None
 
-def check_multiday_level_and_1m_reversal():
+def is_us_dst(dt_utc):
+    year = dt_utc.year
+    mar_first = datetime(year, 3, 1, tzinfo=timezone.utc)
+    mar_second_sun = 14 - (mar_first.weekday() + 1) % 7
+    dst_start = datetime(year, 3, mar_second_sun, 2, tzinfo=timezone.utc)
+
+    nov_first = datetime(year, 11, 1, tzinfo=timezone.utc)
+    nov_first_sun = 7 - (nov_first.weekday() + 1) % 7
+    if nov_first_sun == 0:
+        nov_first_sun = 7
+    dst_end = datetime(year, 11, nov_first_sun, 2, tzinfo=timezone.utc)
+
+    return dst_start <= dt_utc < dst_end
+
+def check_institutional_setup():
     global last_alert_time
 
     if not is_market_open():
         return
 
-    # 1. 2 Din Se 10-15 Din Purane Major Levels Extract Karein (Daily + 4H timeframe)
-    daily_candles = get_candles("1day", 15)  # Pichhle 15 dino ka data
-    h4_candles = get_candles("4h", 40)       # Pichhle 7-10 dino ka 4H data
+    now_utc = datetime.now(timezone.utc)
+    dst_active = is_us_dst(now_utc)
 
-    if not daily_candles or not h4_candles:
+    # 1. 1-Hour Trend Direction (Anti-Trend Breakout Protection)
+    c1h = get_candles("1h", 10)
+    if not c1h or len(c1h) < 5:
         return
 
-    major_levels = []
+    h1_close = float(c1h[0]["close"])
+    h1_sma = sum([float(x["close"]) for x in c1h[:5]]) / 5.0
+    h1_bullish = h1_close > h1_sma
+    h1_bearish = h1_close < h1_sma
 
-    # Daily key levels (High, Low, Body Open, Body Close)
-    for c in daily_candles[1:]:  # Aaj ki candle chhodkar pichhle 2 se 14 din
-        major_levels.append(("Daily High", float(c["high"])))
-        major_levels.append(("Daily Low", float(c["low"])))
-        major_levels.append(("Daily Body", max(float(c["open"]), float(c["close"]))))
-        major_levels.append(("Daily Body", min(float(c["open"]), float(c["close"]))))
+    # 2. Previous Day High & Low (PDH / PDL)
+    daily = get_candles("1day", 5)
+    if not daily or len(daily) < 2:
+        return
+    pdh = float(daily[1]["high"])
+    pdl = float(daily[1]["low"])
 
-    # 4-Hour key swing levels (Pichhle 2-10 din ke 4H levels)
-    for c in h4_candles[6:]:  # Pichhle 24 ghante ke baad ke purane swings
-        major_levels.append(("4H Level", float(c["high"])))
-        major_levels.append(("4H Level", float(c["low"])))
-
-    # 2. Check Karein Ki Current Price Kis Multi-Day Level Par Reversal De Rahi Hai
-    c1m = get_candles("1min", 15)
-    if not c1m or len(c1m) < 5:
+    # 3. Dynamic Asian Range (Auto Sardi/Garmi DST)
+    c15m = get_candles("15min", 50)
+    if not c15m or len(c15m) < 10:
         return
 
-    # c1m[0] = Candle 3 (Current closing candle jo 3-4s me close hogi)
-    # c1m[1] = Candle 2 (Impulse candle jisme FVG hona compulsory hai)
-    # c1m[2] = Candle 1 (Opposite color first reversal candle)
-    c3 = c1m[0]
-    c2 = c1m[1]
-    c1 = c1m[2]
+    asia_candles = []
+    asia_start = 0 if dst_active else 1
+    asia_end = 6 if dst_active else 7
+
+    for c in c15m:
+        try:
+            dt = datetime.strptime(c["datetime"], "%Y-%m-%d %H:%M:%S")
+            if asia_start <= dt.hour < asia_end:
+                asia_candles.append(c)
+        except:
+            pass
+
+    asia_high = max([float(x["high"]) for x in asia_candles]) if asia_candles else pdh
+    asia_low = min([float(x["low"]) for x in asia_candles]) if asia_candles else pdl
+
+    # 4. 15-Minute Level Check: Wick-Only Sweep Validation (No body close outside)
+    recent_15m = c15m[0]
+    m15_high = float(recent_15m["high"])
+    m15_low = float(recent_15m["low"])
+    m15_close = float(recent_15m["close"])
+    m15_open = float(recent_15m["open"])
+    m15_body_top = max(m15_open, m15_close)
+    m15_body_bottom = min(m15_open, m15_close)
+
+    valid_bearish_sweep = False
+    valid_bullish_sweep = False
+    swept_level = 0.0
+    level_type = ""
+
+    # Bearish Sweep: Wick upar gayi par body level ke niche close hui
+    for ref_level, name in [(pdh, "Previous Day High (PDH)"), (asia_high, "Asian Session High")]:
+        if m15_high >= ref_level and m15_body_top < ref_level:
+            valid_bearish_sweep = True
+            swept_level = ref_level
+            level_type = name
+            break
+
+    # Bullish Sweep: Wick niche gayi par body level ke upar close hui
+    for ref_level, name in [(pdl, "Previous Day Low (PDL)"), (asia_low, "Asian Session Low")]:
+        if m15_low <= ref_level and m15_body_bottom > ref_level:
+            valid_bullish_sweep = True
+            swept_level = ref_level
+            level_type = name
+            break
+
+    # 5. 1-Minute MSS & Clean Unmitigated FVG Check
+    c1m = get_candles("1min", 25)
+    if not c1m or len(c1m) < 12:
+        return
+
+    c3 = c1m[0]  # Candle 3 (Current closing candle)
+    c2 = c1m[1]  # Candle 2 (Displacement Impulse candle)
+    c1 = c1m[2]  # Candle 1 (Reversal leg start)
 
     alert_time_key = c3["datetime"]
     if alert_time_key == last_alert_time:
@@ -98,77 +158,98 @@ def check_multiday_level_and_1m_reversal():
     c1_open, c1_close = float(c1["open"]), float(c1["close"])
     c1_high, c1_low = float(c1["high"]), float(c1["low"])
 
-    # 3 Candles ka total reach
-    formation_high = max(c1_high, c2_high, c3_high)
-    formation_low = min(c1_low, c2_low, c3_low)
+    recent_swing_high = max([float(x["high"]) for x in c1m[3:12]])
+    recent_swing_low = min([float(x["low"]) for x in c1m[3:12]])
 
     # -------------------------------------------------------------
-    # SETUP 1: SELL (Purana 2-10 Din Ka Resistance Level Tested)
+    # SETUP 1: SELL (Unmitigated Bearish FVG Check)
     # -------------------------------------------------------------
-    # Pattern: Candle 1 GREEN -> Candle 2 RED (FVG) -> Candle 3 RED
-    c1_green = c1_close > c1_open
-    c2_red = c2_close < c2_open
-    c3_red = c3_close < c3_open
-    has_bearish_fvg = c3_high < c1_low  # Candle 2 par FVG
+    if valid_bearish_sweep and not h1_bullish:
+        c1_green = c1_close > c1_open
+        c2_red = c2_close < c2_open
+        c3_red = c3_close < c3_open
 
-    if c1_green and c2_red and c3_red and has_bearish_fvg:
-        # Check karein ki kya ye 3-candle setup kisi 2-10 din purane major high/body par bana hai
-        for lvl_name, lvl_price in major_levels:
-            # Level ko wick sweep kiya ya body touch karke niche reject hua
-            if abs(formation_high - lvl_price) <= 1.2 or (formation_high >= lvl_price and c3_close < lvl_price):
-                last_alert_time = alert_time_key
-                fvg_top = c1_low
-                fvg_bottom = c3_high
-                msg = (
-                    f"🚨 *XAU/USD: MULTI-DAY KEY LEVEL REVERSAL (SELL)* 🚨\n\n"
-                    f"⏰ *Time:* `{alert_time_key}`\n"
-                    f"🏛️ *Tested Level:* `{lvl_price:.2f}` ({lvl_name} - 2 to 10 Days Old)\n"
-                    f"🕯️ *Candle 1:* Green (Level Touch/Sweep)\n"
-                    f"🕯️ *Candle 2:* Red (Impulse FVG Created)\n"
-                    f"🕯️ *Candle 3:* Red (Confirmed Drop)\n"
-                    f"⚡ *Candle 2 FVG Zone:* `{fvg_bottom:.2f} - {fvg_top:.2f}`\n"
-                    f"🎯 *Entry Rule:* FVG Zone *TAP* hone par SELL execute karein!\n"
-                    f"📉 *Current Price:* `{c3_close:.2f}`\n\n"
-                    f"⚠️ *1M Candle 3-4s me close ho rahi hai! (2x Alert)*"
-                )
-                send_alert(msg)
-                return
+        # FVG Zone: c3_high se lekar c1_low tak
+        fvg_gap = c1_low - c3_high
+        mss_done = (c2_close < recent_swing_low) or (c3_close < recent_swing_low)
+
+        # UNMITIGATED CHECK:
+        # Candle 3 ki upper wick ne FVG box ko pehle hi touch nahi kiya hona chahiye
+        unmitigated = c3_high < c1_low
+
+        if c1_green and c2_red and c3_red and (fvg_gap >= 1.00) and mss_done and unmitigated:
+            last_alert_time = alert_time_key
+            highest_sweep = max(c1_high, c2_high, c3_high, m15_high)
+            fvg_entry = c3_high  # Entry jab next candle yahan tap kare
+            sl = round(highest_sweep + 1.60, 2)
+            risk = sl - fvg_entry
+            tp1 = round(fvg_entry - (risk * 2.0), 2)
+            tp2 = round(fvg_entry - (risk * 3.5), 2)
+
+            msg = (
+                f"🔴 *XAU/USD: INSTITUTIONAL SELL SETUP* 🔴\n\n"
+                f"⏰ *Time:* `{alert_time_key}`\n"
+                f"🏛️ *Sweep:* `{swept_level:.2f}` ({level_type}) - *Wick Only*\n"
+                f"🔄 *MSS:* 1M Micro Swing Low Body Broken\n"
+                f"📊 *Fresh FVG Gap:* `${fvg_gap:.2f}` (Unmitigated)\n\n"
+                f"⚡ *1M FVG ZONE:* `{c3_high:.2f} - {c1_low:.2f}`\n"
+                f"🎯 *ACTION:* Ye FVG bilkul fresh hai! Next candle is box me *TAP* kare tab SELL execute karein.\n\n"
+                f"📌 *ORDER PARAMETERS:*\n"
+                f"• *Entry:* `{fvg_entry:.2f}` (FVG Tap)\n"
+                f"• *Stop Loss (SL):* `{sl:.2f}`\n"
+                f"• *Target 1 (1:2 RR):* `{tp1:.2f}`\n"
+                f"• *Target 2 (1:3.5 RR):* `{tp2:.2f}`\n\n"
+                f"⚠️ *1M Candle 3-4s me close ho rahi hai! (2x Alert)*"
+            )
+            send_alert(msg)
+            return
 
     # -------------------------------------------------------------
-    # SETUP 2: BUY (Purana 2-10 Din Ka Support Level Tested)
+    # SETUP 2: BUY (Unmitigated Bullish FVG Check)
     # -------------------------------------------------------------
-    # Pattern: Candle 1 RED -> Candle 2 GREEN (FVG) -> Candle 3 GREEN
-    c1_red = c1_close < c1_open
-    c2_green = c2_close > c2_open
-    c3_green = c3_close > c3_open
-    has_bullish_fvg = c3_low > c1_high  # Candle 2 par FVG
+    if valid_bullish_sweep and not h1_bearish:
+        c1_red = c1_close < c1_open
+        c2_green = c2_close > c2_open
+        c3_green = c3_close > c3_open
 
-    if c1_red and c2_green and c3_green and has_bullish_fvg:
-        # Check karein ki kya ye 3-candle setup kisi 2-10 din purane major low/body par bana hai
-        for lvl_name, lvl_price in major_levels:
-            # Level ko wick sweep kiya ya body touch karke upar bounce hua
-            if abs(formation_low - lvl_price) <= 1.2 or (formation_low <= lvl_price and c3_close > lvl_price):
-                last_alert_time = alert_time_key
-                fvg_top = c3_low
-                fvg_bottom = c1_high
-                msg = (
-                    f"🚨 *XAU/USD: MULTI-DAY KEY LEVEL REVERSAL (BUY)* 🚨\n\n"
-                    f"⏰ *Time:* `{alert_time_key}`\n"
-                    f"🏛️ *Tested Level:* `{lvl_price:.2f}` ({lvl_name} - 2 to 10 Days Old)\n"
-                    f"🕯️ *Candle 1:* Red (Level Touch/Sweep)\n"
-                    f"🕯️ *Candle 2:* Green (Impulse FVG Created)\n"
-                    f"🕯️ *Candle 3:* Green (Confirmed Bounce)\n"
-                    f"⚡ *Candle 2 FVG Zone:* `{fvg_bottom:.2f} - {fvg_top:.2f}`\n"
-                    f"🎯 *Entry Rule:* FVG Zone *TAP* hone par BUY execute karein!\n"
-                    f"📈 *Current Price:* `{c3_close:.2f}`\n\n"
-                    f"⚠️ *1M Candle 3-4s me close ho rahi hai! (2x Alert)*"
-                )
-                send_alert(msg)
-                return
+        # FVG Zone: c1_high se lekar c3_low tak
+        fvg_gap = c3_low - c1_high
+        mss_done = (c2_close > recent_swing_high) or (c3_close > recent_swing_high)
+
+        # UNMITIGATED CHECK:
+        # Candle 3 ki lower wick ne FVG box ko pehle hi touch nahi kiya hona chahiye
+        unmitigated = c3_low > c1_high
+
+        if c1_red and c2_green and c3_green and (fvg_gap >= 1.00) and mss_done and unmitigated:
+            last_alert_time = alert_time_key
+            lowest_sweep = min(c1_low, c2_low, c3_low, m15_low)
+            fvg_entry = c3_low  # Entry jab next candle yahan tap kare
+            sl = round(lowest_sweep - 1.60, 2)
+            risk = fvg_entry - sl
+            tp1 = round(fvg_entry + (risk * 2.0), 2)
+            tp2 = round(fvg_entry + (risk * 3.5), 2)
+
+            msg = (
+                f"🟢 *XAU/USD: INSTITUTIONAL BUY SETUP* 🟢\n\n"
+                f"⏰ *Time:* `{alert_time_key}`\n"
+                f"🏛️ *Sweep:* `{swept_level:.2f}` ({level_type}) - *Wick Only*\n"
+                f"🔄 *MSS:* 1M Micro Swing High Body Broken\n"
+                f"📊 *Fresh FVG Gap:* `${fvg_gap:.2f}` (Unmitigated)\n\n"
+                f"⚡ *1M FVG ZONE:* `{c1_high:.2f} - {c3_low:.2f}`\n"
+                f"🎯 *ACTION:* Ye FVG bilkul fresh hai! Next candle is box me *TAP* kare tab BUY execute karein.\n\n"
+                f"📌 *ORDER PARAMETERS:*\n"
+                f"• *Entry:* `{fvg_entry:.2f}` (FVG Tap)\n"
+                f"• *Stop Loss (SL):* `{sl:.2f}`\n"
+                f"• *Target 1 (1:2 RR):* `{tp1:.2f}`\n"
+                f"• *Target 2 (1:3.5 RR):* `{tp2:.2f}`\n\n"
+                f"⚠️ *1M Candle 3-4s me close ho rahi hai! (2x Alert)*"
+            )
+            send_alert(msg)
+            return
 
 def bot_loop():
     time.sleep(3)
-    send_alert("⚡ *Gold Multi-Day Key Level Bot Live!*\n2 se 10 din purane major levels touch hone par 1M 3-candle FVG reversal par alert aayega.")
+    send_alert("⚡ *Gold Strict Unmitigated SMC Scanner Live!*\nCandle 3 agar FVG ko touch karke jaayegi toh alert reject ho jaayega. Sirf 100% fresh aur open FVG par alert aayega.")
     
     while True:
         try:
@@ -179,7 +260,7 @@ def bot_loop():
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-            check_multiday_level_and_1m_reversal()
+            check_institutional_setup()
             time.sleep(6)
         except Exception as err:
             print("Loop Exception:", err, flush=True)
@@ -189,7 +270,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Gold Multi-Day Scanner Running!")
+        self.wfile.write(b"Gold Unmitigated SMC Bot Running!")
 
     def do_HEAD(self):
         self.send_response(200)
